@@ -28,6 +28,90 @@ Context or summary information. Informational findings do not affect the exit co
 
 ## Findings
 
+### `mesh/degenerate-face`
+
+Severity: `ERROR`
+
+Example:
+
+```text
+ERROR: face 128 is degenerate (face 128) [mesh/degenerate-face]
+```
+
+What it means:
+
+A triangle has repeated vertices or zero area.
+
+Common cases:
+
+- Duplicate vertices collapsed a triangle into a line or point.
+- Exporter or remesher emitted zero-area triangles.
+- Floating-point cleanup left invalid faces behind.
+
+Why it matters:
+
+Degenerate triangles do not describe real surface area and can confuse topology, normal, volume, and slicing calculations.
+
+Current `--fix` behavior:
+
+Fixable. `--fix` removes degenerate faces.
+
+Recommended action:
+
+Run:
+
+```bash
+meshlint model.stl --fix
+```
+
+JSON fields:
+
+- `face_ids`: the degenerate face
+- `metrics.area_mm2`: computed triangle area
+- `metrics.repeated_vertex`: `1` when the face repeats a vertex, otherwise `0`
+
+### `mesh/duplicate-face`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: face 22 duplicates face 9 (faces 9, 22) [mesh/duplicate-face]
+```
+
+What it means:
+
+Two triangles use the same three vertices, regardless of winding order.
+
+Common cases:
+
+- Duplicate surfaces from export.
+- Boolean operations that left coincident faces.
+- Manual mesh edits that copied geometry in place.
+
+Why it matters:
+
+Duplicate faces can make edges appear non-manifold and can confuse slicers, normals, and volume estimates.
+
+Current `--fix` behavior:
+
+Fixable. `--fix` removes duplicate faces.
+
+Recommended action:
+
+Run:
+
+```bash
+meshlint model.stl --fix
+```
+
+JSON fields:
+
+- `face_ids`: original face and duplicate face
+- `metrics.original_face`: first face with this vertex set
+- `metrics.duplicate_face`: duplicate face id
+
 ### `mesh/non-manifold`
 
 Severity: `ERROR`
@@ -72,6 +156,11 @@ JSON fields:
 - `metrics.vertex_a`: first edge vertex id
 - `metrics.vertex_b`: second edge vertex id
 - `metrics.faces`: number of faces using the edge
+
+Example meshes:
+
+- [open-boundary-triangle.stl](../examples/meshes/open-boundary-triangle.stl)
+- [non-manifold-extra-face.stl](../examples/meshes/non-manifold-extra-face.stl)
 
 ### `mesh/boundary-loop`
 
@@ -120,6 +209,10 @@ JSON fields:
 - `metrics.vertices`: number of vertices in the component
 - `metrics.closed`: `1` when every boundary vertex has degree 2, otherwise `0`
 
+Example mesh:
+
+- [open-boundary-triangle.stl](../examples/meshes/open-boundary-triangle.stl)
+
 ### `mesh/inconsistent-normals`
 
 Severity: `WARN`
@@ -163,6 +256,97 @@ JSON fields:
 - `face_ids`: the two adjacent faces with conflicting winding
 - `metrics.vertex_a`: first shared edge vertex id
 - `metrics.vertex_b`: second shared edge vertex id
+
+Example mesh:
+
+- [inconsistent-normals-tetra.stl](../examples/meshes/inconsistent-normals-tetra.stl)
+
+### `mesh/inverted-normals`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: mesh winding appears globally inverted [mesh/inverted-normals]
+```
+
+What it means:
+
+The mesh has negative signed volume, which usually means the shell is wound inward instead of outward.
+
+Common cases:
+
+- Exporter flipped face winding.
+- Boolean operation inverted a shell.
+- A mesh was mirrored without correcting normals.
+
+Why it matters:
+
+Inside/outside classification can be reversed. That can break hollowing, support placement, resin-trap analysis, and slicer repair heuristics.
+
+Current `--fix` behavior:
+
+Fixable. `--fix` flips global winding when signed volume is negative.
+
+Recommended action:
+
+Run:
+
+```bash
+meshlint model.stl --fix
+```
+
+JSON fields:
+
+- `metrics.signed_volume_mm3`: signed volume estimate
+
+Example mesh:
+
+- [inverted-normals-tetra.stl](../examples/meshes/inverted-normals-tetra.stl)
+
+### `mesh/self-intersection`
+
+Severity: `ERROR`
+
+Example:
+
+```text
+ERROR: faces 120 and 844 intersect (faces 120, 844) [mesh/self-intersection]
+```
+
+What it means:
+
+Two non-adjacent triangles cross through each other.
+
+Common cases:
+
+- Failed boolean operations.
+- Overlapping parts exported as one mesh.
+- Sculpted or scanned surfaces that pass through themselves.
+- Shells pushed through each other during editing.
+
+Why it matters:
+
+Self-intersections make inside/outside ambiguous and can cause slicers to fill, erase, or reinterpret regions unpredictably.
+
+Current `--fix` behavior:
+
+Not safely auto-fixable. The current implementation reports the intersecting face pair but does not modify the mesh.
+
+Recommended action:
+
+Repair the source model with boolean cleanup, remeshing, or manual surface edits.
+
+JSON fields:
+
+- `face_ids`: the two intersecting faces
+- `metrics.face_a`: first intersecting face
+- `metrics.face_b`: second intersecting face
+
+Example mesh:
+
+- [self-intersection.stl](../examples/meshes/self-intersection.stl)
 
 ### `mesh/tiny-shell`
 
@@ -215,6 +399,10 @@ JSON fields:
 - `metrics.size_estimate_mm3`: estimated shell size
 - `metrics.threshold_mm3`: threshold used for the check
 
+Example mesh:
+
+- [tiny-shell.stl](../examples/meshes/tiny-shell.stl)
+
 ### `mesh/disconnected-shell`
 
 Severity: `WARN`
@@ -256,6 +444,10 @@ JSON fields:
 - `metrics.size_estimate_mm3`: estimated shell size
 - `metrics.threshold_mm3`: tiny-shell threshold used for classification
 
+Example mesh:
+
+- [disconnected-shell.stl](../examples/meshes/disconnected-shell.stl)
+
 ### `mesh/disconnected-shells-summary`
 
 Severity: `INFO`
@@ -281,6 +473,59 @@ Indirectly affected. If `--fix` removes tiny shells or welds separated component
 JSON fields:
 
 - `metrics.shells`: total shell count
+
+Example meshes:
+
+- [tiny-shell.stl](../examples/meshes/tiny-shell.stl)
+- [disconnected-shell.stl](../examples/meshes/disconnected-shell.stl)
+
+### `sla/large-cross-section`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: large cross-section near layer 428 is 1440.20 mm2; threshold is 1200.00 mm2 (faces 1024, 1025, 1026, 1027, +42 more) [sla/large-cross-section]
+```
+
+What it means:
+
+For SLA profiles, `meshlint` estimates projected XY area per layer and reports layers whose area exceeds the configured threshold.
+
+Common cases:
+
+- Large flat faces parallel to the build plate.
+- A model oriented with its widest side horizontal.
+- Thick solid sections that create high peel force.
+
+Why it matters:
+
+Large cross-sections can increase peel force, create suction stress, and raise the chance of print failure on resin printers.
+
+Current `--fix` behavior:
+
+Not auto-fixable. This is usually solved by reorienting the model, hollowing, adding drainage/venting, or changing support strategy.
+
+Recommended action:
+
+Try a different orientation or reduce large flat peel areas. Tune the threshold and layer height:
+
+```bash
+meshlint model.stl --process sla --large-cross-section 900 --layer-height 0.05
+```
+
+JSON fields:
+
+- `face_ids`: faces contributing to the layer estimate
+- `metrics.layer`: estimated layer index
+- `metrics.z_mm`: estimated Z position
+- `metrics.area_mm2`: estimated projected area
+- `metrics.threshold_mm2`: configured threshold
+
+Example mesh:
+
+- [sla-large-cross-section.stl](../examples/meshes/sla-large-cross-section.stl)
 
 ## Fixes
 
@@ -428,7 +673,6 @@ These checks are part of the product direction but are not implemented yet:
 - `print/unsupported-island`
 - `sla/resin-trap`
 - `sla/suction-cup`
-- `sla/large-cross-section`
 - `print/fragile-feature`
 
 They should remain out of release notes and rule docs until they produce real findings.

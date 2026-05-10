@@ -1,0 +1,16 @@
+solid large_cross_section
+facet normal 0 0 1
+outer loop
+vertex 0 0 0
+vertex 50 0 0
+vertex 50 50 0
+endloop
+endfacet
+facet normal 0 0 1
+outer loop
+vertex 0 0 0
+vertex 50 50 0
+vertex 0 50 0
+endloop
+endfacet
+endsolid large_cross_section

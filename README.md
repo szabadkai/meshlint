@@ -6,7 +6,12 @@ Like ESLint, but for 3D models.
 
 - non-manifold edges
 - boundary loops / open boundary components
+- degenerate faces
+- duplicate faces
 - inconsistent face winding / normals
+- inverted normals
+- self-intersections
+- SLA large cross-sections
 - disconnected shells
 - tiny disconnected shells
 - duplicate vertices
@@ -34,7 +39,9 @@ model.stl
   ERROR: edge 12-44 is shared by 1 faces; expected 2 (face 91) [mesh/non-manifold]
   ERROR: boundary loop 0 has 18 edges; mesh surface is open (faces 91, 92, 93, 94, +6 more) [mesh/boundary-loop]
   ERROR: edge 44-45 is shared by 3 faces; expected 2 (faces 91, 104, 118) [mesh/non-manifold]
+  ERROR: faces 120 and 844 intersect (faces 120, 844) [mesh/self-intersection]
   WARN: shell 7 has 4 faces and is below 1.000 mm3 (faces 320, 321, 322, 323) [mesh/tiny-shell]
+  WARN: large cross-section near layer 428 is 1440.20 mm2; threshold is 1200.00 mm2 [sla/large-cross-section]
   INFO: mesh contains 2 disconnected shells [mesh/disconnected-shells-summary]
 
 Wrote: model.fixed.stl
@@ -42,7 +49,7 @@ Wrote: model.fixed.stl
 
 Each topological defect is emitted as its own finding in text and JSON. Large meshes can produce many lines; this is intentional so the output can be consumed like a linter report.
 
-See [docs/issues.md](docs/issues.md) for the full issue and fix reference.
+See [docs/issues.md](docs/issues.md) for the full issue and fix reference. See [examples](examples/README.md) for small GitHub-renderable STL meshes that demonstrate common findings.
 
 Exit codes:
 
@@ -70,7 +77,9 @@ const report = lintMesh(bytes, "stl", {
   thresholds: {
     wall_min_mm: 0.8,
     tiny_shell_volume_mm3: 1.0,
-    weld_tolerance_mm: 0.01
+    weld_tolerance_mm: 0.01,
+    layer_height_mm: 0.05,
+    large_cross_section_mm2: 1200
   }
 });
 

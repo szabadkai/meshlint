@@ -36,6 +36,10 @@ pub struct Thresholds {
     pub tiny_shell_volume_mm3: f32,
     #[serde(default = "default_weld_tolerance_mm")]
     pub weld_tolerance_mm: f32,
+    #[serde(default = "default_layer_height_mm")]
+    pub layer_height_mm: f32,
+    #[serde(default = "default_large_cross_section_mm2")]
+    pub large_cross_section_mm2: f32,
 }
 
 impl Default for Thresholds {
@@ -44,6 +48,8 @@ impl Default for Thresholds {
             wall_min_mm: default_wall_min_mm(),
             tiny_shell_volume_mm3: default_tiny_shell_volume_mm3(),
             weld_tolerance_mm: default_weld_tolerance_mm(),
+            layer_height_mm: default_layer_height_mm(),
+            large_cross_section_mm2: default_large_cross_section_mm2(),
         }
     }
 }
@@ -62,6 +68,14 @@ fn default_tiny_shell_volume_mm3() -> f32 {
 
 fn default_weld_tolerance_mm() -> f32 {
     0.01
+}
+
+fn default_layer_height_mm() -> f32 {
+    0.05
+}
+
+fn default_large_cross_section_mm2() -> f32 {
+    1200.0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,10 +175,17 @@ pub fn fix_mesh_bytes(
 
 pub fn lint_mesh(mesh: &Mesh, options: &LintOptions) -> Vec<Finding> {
     let mut findings = Vec::new();
+    findings.extend(check_degenerate_faces(mesh));
+    findings.extend(check_duplicate_faces(mesh));
     findings.extend(check_non_manifold(mesh));
     findings.extend(check_boundary_loops(mesh));
     findings.extend(check_normal_consistency(mesh));
+    findings.extend(check_inverted_normals(mesh));
+    findings.extend(check_self_intersections(mesh));
     findings.extend(check_shells(mesh, options.thresholds.tiny_shell_volume_mm3));
+    if options.process.eq_ignore_ascii_case("sla") {
+        findings.extend(check_large_cross_sections(mesh, &options.thresholds));
+    }
     findings
 }
 
@@ -220,18 +241,20 @@ fn parse_binary_stl(bytes: &[u8]) -> Result<Mesh, MeshLintError> {
 
     let mut vertices = Vec::with_capacity(triangle_count * 3);
     let mut faces = Vec::with_capacity(triangle_count);
+    let mut vertex_ids = HashMap::new();
     let mut offset = 84;
     for _ in 0..triangle_count {
         offset += 12;
-        let base = vertices.len() as u32;
-        for _ in 0..3 {
+        let mut face = [0u32; 3];
+        for vertex_slot in &mut face {
             let x = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
             let y = f32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
             let z = f32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap());
-            vertices.push([x, y, z]);
+            let vertex_index = add_vertex(&mut vertices, &mut vertex_ids, [x, y, z]);
+            *vertex_slot = vertex_index;
             offset += 12;
         }
-        faces.push([base, base + 1, base + 2]);
+        faces.push(face);
         offset += 2;
     }
 
@@ -243,6 +266,7 @@ fn parse_ascii_stl(bytes: &[u8]) -> Result<Mesh, MeshLintError> {
         .map_err(|_| MeshLintError::InvalidStl("ASCII STL is not valid UTF-8".into()))?;
     let mut vertices = Vec::new();
     let mut faces = Vec::new();
+    let mut vertex_ids = HashMap::new();
     let mut pending = Vec::with_capacity(3);
 
     for line in text.lines() {
@@ -253,11 +277,10 @@ fn parse_ascii_stl(bytes: &[u8]) -> Result<Mesh, MeshLintError> {
         let x = parse_f32(parts.next(), "x")?;
         let y = parse_f32(parts.next(), "y")?;
         let z = parse_f32(parts.next(), "z")?;
-        pending.push([x, y, z]);
+        pending.push(add_vertex(&mut vertices, &mut vertex_ids, [x, y, z]));
         if pending.len() == 3 {
-            let base = vertices.len() as u32;
-            vertices.append(&mut pending);
-            faces.push([base, base + 1, base + 2]);
+            faces.push([pending[0], pending[1], pending[2]]);
+            pending.clear();
         }
     }
 
@@ -266,6 +289,35 @@ fn parse_ascii_stl(bytes: &[u8]) -> Result<Mesh, MeshLintError> {
     }
 
     Ok(Mesh { vertices, faces })
+}
+
+fn add_vertex(
+    vertices: &mut Vec<[f32; 3]>,
+    vertex_ids: &mut HashMap<(u32, u32, u32), u32>,
+    vertex: [f32; 3],
+) -> u32 {
+    let key = vertex_key(vertex);
+    *vertex_ids.entry(key).or_insert_with(|| {
+        let id = vertices.len() as u32;
+        vertices.push(vertex);
+        id
+    })
+}
+
+fn vertex_key(vertex: [f32; 3]) -> (u32, u32, u32) {
+    (
+        normalized_f32_bits(vertex[0]),
+        normalized_f32_bits(vertex[1]),
+        normalized_f32_bits(vertex[2]),
+    )
+}
+
+fn normalized_f32_bits(value: f32) -> u32 {
+    if value == 0.0 {
+        0.0f32.to_bits()
+    } else {
+        value.to_bits()
+    }
 }
 
 fn parse_f32(value: Option<&str>, axis: &str) -> Result<f32, MeshLintError> {
@@ -298,6 +350,62 @@ pub fn write_binary_stl(mesh: &Mesh) -> Result<Vec<u8>, MeshLintError> {
     }
 
     Ok(out)
+}
+
+fn check_degenerate_faces(mesh: &Mesh) -> Vec<Finding> {
+    mesh.faces
+        .iter()
+        .enumerate()
+        .filter_map(|(face_id, face)| {
+            let repeated_vertex = face[0] == face[1] || face[1] == face[2] || face[0] == face[2];
+            let area = triangle_area_from_vertices(&mesh.vertices, *face);
+            if !repeated_vertex && area > f32::EPSILON {
+                return None;
+            }
+
+            let mut metrics = HashMap::new();
+            metrics.insert("area_mm2".to_string(), area as f64);
+            metrics.insert(
+                "repeated_vertex".to_string(),
+                if repeated_vertex { 1.0 } else { 0.0 },
+            );
+            Some(Finding {
+                rule_id: "mesh/degenerate-face".to_string(),
+                severity: Severity::Error,
+                message: format!("face {face_id} is degenerate"),
+                face_ids: vec![face_id as u32],
+                metrics,
+                recommendation: Some("Run with --fix to remove degenerate faces.".into()),
+            })
+        })
+        .collect()
+}
+
+fn check_duplicate_faces(mesh: &Mesh) -> Vec<Finding> {
+    let mut seen = HashMap::<[u32; 3], u32>::new();
+    let mut findings = Vec::new();
+
+    for (face_id, face) in mesh.faces.iter().enumerate() {
+        let mut sorted = *face;
+        sorted.sort_unstable();
+        if let Some(original_face_id) = seen.get(&sorted).copied() {
+            let mut metrics = HashMap::new();
+            metrics.insert("original_face".to_string(), original_face_id as f64);
+            metrics.insert("duplicate_face".to_string(), face_id as f64);
+            findings.push(Finding {
+                rule_id: "mesh/duplicate-face".to_string(),
+                severity: Severity::Warn,
+                message: format!("face {face_id} duplicates face {original_face_id}"),
+                face_ids: vec![original_face_id, face_id as u32],
+                metrics,
+                recommendation: Some("Run with --fix to remove duplicate faces.".into()),
+            });
+        } else {
+            seen.insert(sorted, face_id as u32);
+        }
+    }
+
+    findings
 }
 
 fn check_non_manifold(mesh: &Mesh) -> Vec<Finding> {
@@ -543,6 +651,132 @@ fn check_shells(mesh: &Mesh, tiny_volume: f32) -> Vec<Finding> {
     }
 
     findings
+}
+
+fn check_inverted_normals(mesh: &Mesh) -> Vec<Finding> {
+    let volume = signed_volume(mesh);
+    if volume >= 0.0 {
+        return Vec::new();
+    }
+
+    let mut metrics = HashMap::new();
+    metrics.insert("signed_volume_mm3".to_string(), volume as f64);
+    vec![Finding {
+        rule_id: "mesh/inverted-normals".to_string(),
+        severity: Severity::Warn,
+        message: "mesh winding appears globally inverted".to_string(),
+        face_ids: Vec::new(),
+        metrics,
+        recommendation: Some("Run with --fix to flip face winding outward.".into()),
+    }]
+}
+
+fn check_self_intersections(mesh: &Mesh) -> Vec<Finding> {
+    let face_boxes = mesh
+        .faces
+        .iter()
+        .map(|face| face_bounds(mesh, *face))
+        .collect::<Vec<_>>();
+    let mut face_order = (0..mesh.faces.len()).collect::<Vec<_>>();
+    face_order.sort_by(|a, b| {
+        face_boxes[*a].0[0]
+            .partial_cmp(&face_boxes[*b].0[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut findings = Vec::new();
+
+    for (order_index, &a_id) in face_order.iter().enumerate() {
+        let a_max_x = face_boxes[a_id].1[0];
+        for &b_id in &face_order[order_index + 1..] {
+            if face_boxes[b_id].0[0] > a_max_x + 1.0e-6 {
+                break;
+            }
+            let face_a = mesh.faces[a_id];
+            let face_b = mesh.faces[b_id];
+            if faces_share_vertex(face_a, face_b)
+                || !bounds_overlap(face_boxes[a_id], face_boxes[b_id])
+            {
+                continue;
+            }
+
+            if triangles_intersect(mesh, face_a, face_b) {
+                let mut metrics = HashMap::new();
+                metrics.insert("face_a".to_string(), a_id as f64);
+                metrics.insert("face_b".to_string(), b_id as f64);
+                findings.push(Finding {
+                    rule_id: "mesh/self-intersection".to_string(),
+                    severity: Severity::Error,
+                    message: format!("faces {a_id} and {b_id} intersect"),
+                    face_ids: vec![a_id as u32, b_id as u32],
+                    metrics,
+                    recommendation: Some(
+                        "Separate or boolean-repair intersecting surfaces in the source model."
+                            .into(),
+                    ),
+                });
+            }
+        }
+    }
+
+    findings
+}
+
+fn check_large_cross_sections(mesh: &Mesh, thresholds: &Thresholds) -> Vec<Finding> {
+    if thresholds.layer_height_mm <= 0.0 || thresholds.large_cross_section_mm2 <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut layers = HashMap::<i64, (f32, Vec<u32>)>::new();
+    for (face_id, face) in mesh.faces.iter().enumerate() {
+        let [a, b, c] = face_vertices(mesh, *face);
+        let area = projected_xy_area(a, b, c);
+        if area <= f32::EPSILON {
+            continue;
+        }
+
+        let z = (a[2] + b[2] + c[2]) / 3.0;
+        let layer = (z / thresholds.layer_height_mm).round() as i64;
+        let entry = layers.entry(layer).or_default();
+        entry.0 += area;
+        entry.1.push(face_id as u32);
+    }
+
+    let mut layers = layers.into_iter().collect::<Vec<_>>();
+    layers.sort_by_key(|(layer, _)| *layer);
+
+    layers
+        .into_iter()
+        .filter_map(|(layer, (area, mut face_ids))| {
+            if area < thresholds.large_cross_section_mm2 {
+                return None;
+            }
+            face_ids.sort_unstable();
+            face_ids.dedup();
+
+            let mut metrics = HashMap::new();
+            metrics.insert("layer".to_string(), layer as f64);
+            metrics.insert("z_mm".to_string(), layer as f64 * thresholds.layer_height_mm as f64);
+            metrics.insert("area_mm2".to_string(), area as f64);
+            metrics.insert(
+                "threshold_mm2".to_string(),
+                thresholds.large_cross_section_mm2 as f64,
+            );
+
+            Some(Finding {
+                rule_id: "sla/large-cross-section".to_string(),
+                severity: Severity::Warn,
+                message: format!(
+                    "large cross-section near layer {layer} is {area:.2} mm2; threshold is {:.2} mm2",
+                    thresholds.large_cross_section_mm2
+                ),
+                face_ids,
+                metrics,
+                recommendation: Some(
+                    "Reorient the model or reduce large flat peel areas for SLA printing.".into(),
+                ),
+            })
+        })
+        .collect()
 }
 
 fn weld_vertices(mesh: &mut Mesh, tolerance: f32) -> Vec<Fix> {
@@ -904,9 +1138,7 @@ fn shared_edge_same_direction(a: [u32; 3], b: [u32; 3]) -> bool {
 }
 
 fn face_normal(mesh: &Mesh, face: [u32; 3]) -> [f32; 3] {
-    let a = mesh.vertices[face[0] as usize];
-    let b = mesh.vertices[face[1] as usize];
-    let c = mesh.vertices[face[2] as usize];
+    let [a, b, c] = face_vertices(mesh, face);
     let normal = cross(sub(b, a), sub(c, a));
     let length = dot(normal, normal).sqrt();
     if length == 0.0 {
@@ -916,11 +1148,94 @@ fn face_normal(mesh: &Mesh, face: [u32; 3]) -> [f32; 3] {
     }
 }
 
+fn face_vertices(mesh: &Mesh, face: [u32; 3]) -> [[f32; 3]; 3] {
+    [
+        mesh.vertices[face[0] as usize],
+        mesh.vertices[face[1] as usize],
+        mesh.vertices[face[2] as usize],
+    ]
+}
+
+fn face_bounds(mesh: &Mesh, face: [u32; 3]) -> ([f32; 3], [f32; 3]) {
+    let vertices = face_vertices(mesh, face);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for vertex in vertices {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex[axis]);
+            max[axis] = max[axis].max(vertex[axis]);
+        }
+    }
+    (min, max)
+}
+
+fn bounds_overlap(a: ([f32; 3], [f32; 3]), b: ([f32; 3], [f32; 3])) -> bool {
+    const EPS: f32 = 1.0e-6;
+    (0..3).all(|axis| a.0[axis] <= b.1[axis] + EPS && b.0[axis] <= a.1[axis] + EPS)
+}
+
+fn faces_share_vertex(a: [u32; 3], b: [u32; 3]) -> bool {
+    a.iter().any(|a_vertex| b.contains(a_vertex))
+}
+
+fn triangles_intersect(mesh: &Mesh, face_a: [u32; 3], face_b: [u32; 3]) -> bool {
+    let a = face_vertices(mesh, face_a);
+    let b = face_vertices(mesh, face_b);
+
+    triangle_edges(a)
+        .iter()
+        .any(|(start, end)| segment_intersects_triangle(*start, *end, b))
+        || triangle_edges(b)
+            .iter()
+            .any(|(start, end)| segment_intersects_triangle(*start, *end, a))
+}
+
+fn triangle_edges(vertices: [[f32; 3]; 3]) -> [([f32; 3], [f32; 3]); 3] {
+    [
+        (vertices[0], vertices[1]),
+        (vertices[1], vertices[2]),
+        (vertices[2], vertices[0]),
+    ]
+}
+
+fn segment_intersects_triangle(start: [f32; 3], end: [f32; 3], tri: [[f32; 3]; 3]) -> bool {
+    const EPS: f32 = 1.0e-6;
+    let direction = sub(end, start);
+    let edge1 = sub(tri[1], tri[0]);
+    let edge2 = sub(tri[2], tri[0]);
+    let h = cross(direction, edge2);
+    let det = dot(edge1, h);
+
+    if det.abs() < EPS {
+        return false;
+    }
+
+    let inv_det = 1.0 / det;
+    let s = sub(start, tri[0]);
+    let u = inv_det * dot(s, h);
+    if !(EPS..=1.0 - EPS).contains(&u) {
+        return false;
+    }
+
+    let q = cross(s, edge1);
+    let v = inv_det * dot(direction, q);
+    if v < EPS || u + v > 1.0 - EPS {
+        return false;
+    }
+
+    let t = inv_det * dot(edge2, q);
+    (EPS..=1.0 - EPS).contains(&t)
+}
+
 fn triangle_area_from_vertices(vertices: &[[f32; 3]], face: [u32; 3]) -> f32 {
     let a = vertices[face[0] as usize];
     let b = vertices[face[1] as usize];
     let c = vertices[face[2] as usize];
     dot(cross(sub(b, a), sub(c, a)), cross(sub(b, a), sub(c, a))).sqrt() * 0.5
+}
+
+fn projected_xy_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f32 {
+    ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() * 0.5
 }
 
 fn signed_volume(mesh: &Mesh) -> f32 {

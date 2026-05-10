@@ -25,6 +25,12 @@ struct Args {
     #[arg(long, default_value_t = 0.01)]
     weld_tolerance: f32,
 
+    #[arg(long, default_value_t = 0.05)]
+    layer_height: f32,
+
+    #[arg(long, default_value_t = 1200.0)]
+    large_cross_section: f32,
+
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -52,6 +58,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             wall_min_mm: args.wall_min,
             tiny_shell_volume_mm3: args.tiny_shell_volume,
             weld_tolerance_mm: args.weld_tolerance,
+            layer_height_mm: args.layer_height,
+            large_cross_section_mm2: args.large_cross_section,
         },
     };
 
