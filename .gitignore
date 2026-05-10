@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+
+# Generated mesh repair outputs
+*.fixed.stl
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment files
+.env
+.env.*
+
+# Logs
+*.log

@@ -1,0 +1,14 @@
+[package]
+name = "meshlint-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+meshlint-core = { path = "../meshlint-core" }
+serde_json.workspace = true
+
+[[bin]]
+name = "meshlint"
+path = "src/main.rs"
