@@ -33,6 +33,29 @@ cargo run -p meshlint-cli -- model.stl --max-findings-per-rule 100
 cargo run -p meshlint-cli -- model.stl --max-self-intersection-tests 500000
 ```
 
+`meshlint` also reads an optional JSON config file from `~/.meshlintrc`. The config uses the same option shape as the core API, and any CLI flags you pass override values from the file:
+
+```json
+{
+  "process": "sla",
+  "thresholds": {
+    "wall_min_mm": 0.8,
+    "tiny_shell_volume_mm3": 1.0,
+    "weld_tolerance_mm": 0.01,
+    "layer_height_mm": 0.05,
+    "large_cross_section_mm2": 1200,
+    "tiny_edge_mm": 0.01,
+    "bad_aspect_ratio": 100,
+    "suspicious_min_dimension_mm": 0.5,
+    "suspicious_max_dimension_mm": 1000,
+    "max_self_intersection_tests": 50000,
+    "max_findings_per_rule": 1000
+  }
+}
+```
+
+All fields are optional. Missing values use the built-in defaults.
+
 Text output is intentionally ESLint-like:
 
 ```text
