@@ -8,16 +8,18 @@ Like ESLint, but for 3D models.
 - boundary loops / open boundary components
 - degenerate faces
 - duplicate faces
+- tiny edges
+- bad-aspect triangles
 - inconsistent face winding / normals
 - inverted normals
 - self-intersections
+- zero-volume shells
+- suspicious units / scale
 - SLA large cross-sections
 - disconnected shells
 - tiny disconnected shells
 - duplicate vertices
 - near-duplicate vertices within weld tolerance
-- degenerate faces
-- duplicate faces
 - consistent face orientation
 
 ## CLI
@@ -27,6 +29,8 @@ cargo run -p meshlint-cli -- model.stl --process sla
 cargo run -p meshlint-cli -- model.stl --process sla --fix
 cargo run -p meshlint-cli -- model.stl --process sla --fix --out model.fixed.stl
 cargo run -p meshlint-cli -- model.stl --format json
+cargo run -p meshlint-cli -- model.stl --max-findings-per-rule 100
+cargo run -p meshlint-cli -- model.stl --max-self-intersection-tests 500000
 ```
 
 Text output is intentionally ESLint-like:
@@ -49,13 +53,18 @@ Wrote: model.fixed.stl
 
 Each topological defect is emitted as its own finding in text and JSON. Large meshes can produce many lines; this is intentional so the output can be consumed like a linter report.
 
-See [docs/issues.md](docs/issues.md) for the full issue and fix reference. See [examples](examples/README.md) for small GitHub-renderable STL meshes that demonstrate common findings.
+See [docs/issues.md](docs/issues.md) for the full issue and fix reference, including fixture meshes that demonstrate common findings.
 
 Exit codes:
 
 - `0`: no errors
 - `1`: lint errors found
 - `2`: invalid input, unsupported format, or runtime failure
+
+Performance guards:
+
+- `--max-findings-per-rule`: caps noisy per-defect output per rule. Default: `1000`. Use `0` for no cap.
+- `--max-self-intersection-tests`: caps expensive triangle-pair self-intersection tests. Default: `50000`. Increase for deeper checks on dense meshes.
 
 ## WASM
 
@@ -79,7 +88,13 @@ const report = lintMesh(bytes, "stl", {
     tiny_shell_volume_mm3: 1.0,
     weld_tolerance_mm: 0.01,
     layer_height_mm: 0.05,
-    large_cross_section_mm2: 1200
+    large_cross_section_mm2: 1200,
+    tiny_edge_mm: 0.01,
+    bad_aspect_ratio: 100,
+    suspicious_min_dimension_mm: 0.5,
+    suspicious_max_dimension_mm: 1000,
+    max_self_intersection_tests: 50000,
+    max_findings_per_rule: 1000
   }
 });
 

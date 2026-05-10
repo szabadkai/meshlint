@@ -31,6 +31,24 @@ struct Args {
     #[arg(long, default_value_t = 1200.0)]
     large_cross_section: f32,
 
+    #[arg(long, default_value_t = 0.01)]
+    tiny_edge: f32,
+
+    #[arg(long, default_value_t = 100.0)]
+    bad_aspect_ratio: f32,
+
+    #[arg(long, default_value_t = 0.5)]
+    suspicious_min_dimension: f32,
+
+    #[arg(long, default_value_t = 1000.0)]
+    suspicious_max_dimension: f32,
+
+    #[arg(long, default_value_t = 50_000)]
+    max_self_intersection_tests: usize,
+
+    #[arg(long, default_value_t = 1_000)]
+    max_findings_per_rule: usize,
+
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -60,6 +78,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             weld_tolerance_mm: args.weld_tolerance,
             layer_height_mm: args.layer_height,
             large_cross_section_mm2: args.large_cross_section,
+            tiny_edge_mm: args.tiny_edge,
+            bad_aspect_ratio: args.bad_aspect_ratio,
+            suspicious_min_dimension_mm: args.suspicious_min_dimension,
+            suspicious_max_dimension_mm: args.suspicious_max_dimension,
+            max_self_intersection_tests: args.max_self_intersection_tests,
+            max_findings_per_rule: args.max_findings_per_rule,
         },
     };
 

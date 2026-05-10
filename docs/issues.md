@@ -28,6 +28,38 @@ Context or summary information. Informational findings do not affect the exit co
 
 ## Findings
 
+### `*-truncated`
+
+Severity: `INFO`
+
+Example:
+
+```text
+INFO: 7992 additional mesh/tiny-edge findings omitted after limit 100 [mesh/tiny-edge-truncated]
+```
+
+What it means:
+
+`meshlint` found more findings for a rule than the configured per-rule output limit.
+
+Why it matters:
+
+Large meshes can contain thousands of repeated low-level defects. Truncation keeps CLI and JSON output usable while preserving a count of omitted findings.
+
+Recommended action:
+
+Increase or disable the cap when you need every finding:
+
+```bash
+meshlint model.stl --max-findings-per-rule 5000
+meshlint model.stl --max-findings-per-rule 0
+```
+
+JSON fields:
+
+- `metrics.omitted`: omitted finding count
+- `metrics.limit`: configured per-rule limit
+
 ### `mesh/degenerate-face`
 
 Severity: `ERROR`
@@ -111,6 +143,106 @@ JSON fields:
 - `face_ids`: original face and duplicate face
 - `metrics.original_face`: first face with this vertex set
 - `metrics.duplicate_face`: duplicate face id
+
+### `mesh/tiny-edge`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: edge 0-1 is 0.00100 mm; below 0.01000 mm (face 0) [mesh/tiny-edge]
+```
+
+What it means:
+
+An edge is shorter than the configured tiny-edge threshold.
+
+Common cases:
+
+- Noisy scan or remesh output.
+- Nearly collapsed triangles.
+- CAD exports with tiny sliver features.
+- Geometry that should be welded or simplified.
+
+Why it matters:
+
+Very small edges can destabilize boolean operations, wall-thickness checks, self-intersection checks, and slicer repair heuristics. They are also a common source of skinny triangles.
+
+Current `--fix` behavior:
+
+Partially fixable. If the edge is caused by near-duplicate vertices, `--fix` may remove it through vertex welding and degenerate-face removal. It does not currently remesh arbitrary tiny edges.
+
+Recommended action:
+
+Run:
+
+```bash
+meshlint model.stl --fix
+```
+
+Tune the threshold when needed:
+
+```bash
+meshlint model.stl --tiny-edge 0.005
+```
+
+JSON fields:
+
+- `face_ids`: faces touching the tiny edge
+- `metrics.vertex_a`: first edge vertex id
+- `metrics.vertex_b`: second edge vertex id
+- `metrics.length_mm`: measured edge length
+- `metrics.threshold_mm`: threshold used for the check
+
+Example mesh:
+
+- [tiny-edge.stl](../examples/meshes/tiny-edge.stl)
+
+### `mesh/bad-aspect-triangle`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: face 0 has aspect ratio 1000.00; threshold is 100.00 (face 0) [mesh/bad-aspect-triangle]
+```
+
+What it means:
+
+A triangle's longest edge is much longer than its shortest edge.
+
+Common cases:
+
+- Sliver triangles from boolean operations.
+- Decimation artifacts.
+- Scan cleanup artifacts.
+- CAD tessellation with poor local triangle quality.
+
+Why it matters:
+
+Skinny triangles can make geometric predicates numerically fragile. They also make ray casts, distance checks, and local feature analysis less reliable.
+
+Current `--fix` behavior:
+
+Not directly auto-fixable. `--fix` can remove the worst cases when welding turns them into degenerate faces, but general repair requires remeshing.
+
+Recommended action:
+
+Remesh or simplify the local region if the finding appears near printability defects or failed geometry operations.
+
+JSON fields:
+
+- `face_ids`: the bad-aspect face
+- `metrics.aspect_ratio`: longest edge divided by shortest edge
+- `metrics.threshold`: configured threshold
+- `metrics.shortest_edge_mm`: shortest edge length
+- `metrics.longest_edge_mm`: longest edge length
+
+Example mesh:
+
+- [bad-aspect-triangle.stl](../examples/meshes/bad-aspect-triangle.stl)
 
 ### `mesh/non-manifold`
 
@@ -305,6 +437,101 @@ Example mesh:
 
 - [inverted-normals-tetra.stl](../examples/meshes/inverted-normals-tetra.stl)
 
+### `mesh/zero-volume-shell`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: shell 0 has surface area but near-zero enclosed volume (faces 0, 1) [mesh/zero-volume-shell]
+```
+
+What it means:
+
+A connected shell has nonzero surface area but near-zero signed enclosed volume.
+
+Common cases:
+
+- Open sheets.
+- Duplicate opposite faces.
+- Collapsed geometry.
+- Surfaces that look visible but do not define a solid.
+
+Why it matters:
+
+Zero-volume shells are not printable solids. They often break hollowing, volume estimates, support logic, and wall-thickness checks.
+
+Current `--fix` behavior:
+
+Partially fixable. If the zero-volume shell is tiny, `--fix` may remove it through tiny-shell cleanup. If it is caused by duplicate faces, `--fix` can remove exact duplicates. It does not currently reconstruct solid volume from open sheets.
+
+Recommended action:
+
+Remove sheet-like geometry or give it real thickness in the source model.
+
+JSON fields:
+
+- `face_ids`: faces in the zero-volume shell
+- `metrics.shell`: shell index
+- `metrics.faces`: face count
+- `metrics.volume_mm3`: signed-volume magnitude
+- `metrics.surface_area_mm2`: surface area estimate
+
+Example mesh:
+
+- [zero-volume-shell.stl](../examples/meshes/zero-volume-shell.stl)
+
+### `mesh/unit-suspicious`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: model maximum dimension is 0.100 mm; units may be too small [mesh/unit-suspicious]
+```
+
+What it means:
+
+The model's bounding box is outside the configured expected size range.
+
+Common cases:
+
+- Inches exported as millimeters.
+- Meters exported as millimeters.
+- A normalized asset exported without applying scale.
+- A miniature or engineering detail intentionally outside default thresholds.
+
+Why it matters:
+
+Wrong units can make every printability threshold meaningless. A model that should be 100 mm wide may appear as 3.94 mm or 0.1 mm depending on export scale.
+
+Current `--fix` behavior:
+
+Not auto-fixable. Scaling is a design-intent decision.
+
+Recommended action:
+
+Confirm the model units and rescale intentionally if needed. Tune the thresholds:
+
+```bash
+meshlint model.stl --suspicious-min-dimension 0.1 --suspicious-max-dimension 2000
+```
+
+JSON fields:
+
+- `metrics.x_mm`: X dimension
+- `metrics.y_mm`: Y dimension
+- `metrics.z_mm`: Z dimension
+- `metrics.max_dimension_mm`: largest dimension
+- `metrics.min_threshold_mm`: lower threshold
+- `metrics.max_threshold_mm`: upper threshold
+
+Example mesh:
+
+- [unit-suspicious-small.stl](../examples/meshes/unit-suspicious-small.stl)
+
 ### `mesh/self-intersection`
 
 Severity: `ERROR`
@@ -347,6 +574,42 @@ JSON fields:
 Example mesh:
 
 - [self-intersection.stl](../examples/meshes/self-intersection.stl)
+
+### `mesh/self-intersection-skipped`
+
+Severity: `WARN`
+
+Example:
+
+```text
+WARN: self-intersection check skipped after 50001 candidate tests; limit is 50000 [mesh/self-intersection-skipped]
+```
+
+What it means:
+
+The model is dense enough that the bounded self-intersection pass reached its configured triangle-pair test budget.
+
+Why it matters:
+
+Without a budget, self-intersection checks can dominate runtime on large STL files. This warning means `meshlint` returned a bounded result instead of spending unbounded time on pairwise geometry tests.
+
+Current `--fix` behavior:
+
+Not fixable. This is a runtime guard, not a mesh defect.
+
+Recommended action:
+
+For a faster normal lint, keep the default. For deeper analysis, increase the budget:
+
+```bash
+meshlint model.stl --max-self-intersection-tests 500000
+```
+
+JSON fields:
+
+- `metrics.faces`: face count
+- `metrics.attempted_tests`: candidate triangle tests attempted
+- `metrics.max_tests`: configured test budget
 
 ### `mesh/tiny-shell`
 

@@ -40,6 +40,18 @@ pub struct Thresholds {
     pub layer_height_mm: f32,
     #[serde(default = "default_large_cross_section_mm2")]
     pub large_cross_section_mm2: f32,
+    #[serde(default = "default_tiny_edge_mm")]
+    pub tiny_edge_mm: f32,
+    #[serde(default = "default_bad_aspect_ratio")]
+    pub bad_aspect_ratio: f32,
+    #[serde(default = "default_suspicious_min_dimension_mm")]
+    pub suspicious_min_dimension_mm: f32,
+    #[serde(default = "default_suspicious_max_dimension_mm")]
+    pub suspicious_max_dimension_mm: f32,
+    #[serde(default = "default_max_self_intersection_tests")]
+    pub max_self_intersection_tests: usize,
+    #[serde(default = "default_max_findings_per_rule")]
+    pub max_findings_per_rule: usize,
 }
 
 impl Default for Thresholds {
@@ -50,6 +62,12 @@ impl Default for Thresholds {
             weld_tolerance_mm: default_weld_tolerance_mm(),
             layer_height_mm: default_layer_height_mm(),
             large_cross_section_mm2: default_large_cross_section_mm2(),
+            tiny_edge_mm: default_tiny_edge_mm(),
+            bad_aspect_ratio: default_bad_aspect_ratio(),
+            suspicious_min_dimension_mm: default_suspicious_min_dimension_mm(),
+            suspicious_max_dimension_mm: default_suspicious_max_dimension_mm(),
+            max_self_intersection_tests: default_max_self_intersection_tests(),
+            max_findings_per_rule: default_max_findings_per_rule(),
         }
     }
 }
@@ -76,6 +94,30 @@ fn default_layer_height_mm() -> f32 {
 
 fn default_large_cross_section_mm2() -> f32 {
     1200.0
+}
+
+fn default_tiny_edge_mm() -> f32 {
+    0.01
+}
+
+fn default_bad_aspect_ratio() -> f32 {
+    100.0
+}
+
+fn default_suspicious_min_dimension_mm() -> f32 {
+    0.5
+}
+
+fn default_suspicious_max_dimension_mm() -> f32 {
+    1000.0
+}
+
+fn default_max_self_intersection_tests() -> usize {
+    50_000
+}
+
+fn default_max_findings_per_rule() -> usize {
+    1_000
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -176,17 +218,27 @@ pub fn fix_mesh_bytes(
 pub fn lint_mesh(mesh: &Mesh, options: &LintOptions) -> Vec<Finding> {
     let mut findings = Vec::new();
     findings.extend(check_degenerate_faces(mesh));
+    findings.extend(check_tiny_edges(mesh, options.thresholds.tiny_edge_mm));
+    findings.extend(check_bad_aspect_triangles(
+        mesh,
+        options.thresholds.bad_aspect_ratio,
+    ));
     findings.extend(check_duplicate_faces(mesh));
     findings.extend(check_non_manifold(mesh));
     findings.extend(check_boundary_loops(mesh));
     findings.extend(check_normal_consistency(mesh));
     findings.extend(check_inverted_normals(mesh));
-    findings.extend(check_self_intersections(mesh));
+    findings.extend(check_self_intersections(
+        mesh,
+        options.thresholds.max_self_intersection_tests,
+    ));
     findings.extend(check_shells(mesh, options.thresholds.tiny_shell_volume_mm3));
+    findings.extend(check_zero_volume_shells(mesh));
+    findings.extend(check_suspicious_units(mesh, &options.thresholds));
     if options.process.eq_ignore_ascii_case("sla") {
         findings.extend(check_large_cross_sections(mesh, &options.thresholds));
     }
-    findings
+    cap_findings_per_rule(findings, options.thresholds.max_findings_per_rule)
 }
 
 pub fn fix_mesh(mesh: &mut Mesh, options: &LintOptions) -> Vec<Fix> {
@@ -200,6 +252,46 @@ pub fn fix_mesh(mesh: &mut Mesh, options: &LintOptions) -> Vec<Fix> {
         options.thresholds.tiny_shell_volume_mm3,
     ));
     fixes
+}
+
+fn cap_findings_per_rule(findings: Vec<Finding>, max_per_rule: usize) -> Vec<Finding> {
+    if max_per_rule == 0 {
+        return findings;
+    }
+
+    let mut kept = Vec::new();
+    let mut seen = HashMap::<String, usize>::new();
+    let mut omitted = HashMap::<String, usize>::new();
+
+    for finding in findings {
+        let count = seen.entry(finding.rule_id.clone()).or_default();
+        if *count < max_per_rule {
+            *count += 1;
+            kept.push(finding);
+        } else {
+            *omitted.entry(finding.rule_id).or_default() += 1;
+        }
+    }
+
+    let mut omitted = omitted.into_iter().collect::<Vec<_>>();
+    omitted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rule_id, count) in omitted {
+        let mut metrics = HashMap::new();
+        metrics.insert("omitted".to_string(), count as f64);
+        metrics.insert("limit".to_string(), max_per_rule as f64);
+        kept.push(Finding {
+            rule_id: format!("{rule_id}-truncated"),
+            severity: Severity::Info,
+            message: format!(
+                "{count} additional {rule_id} findings omitted after limit {max_per_rule}"
+            ),
+            face_ids: Vec::new(),
+            metrics,
+            recommendation: Some("Increase --max-findings-per-rule to show more findings.".into()),
+        });
+    }
+
+    kept
 }
 
 fn parse_mesh(bytes: &[u8], format: &str) -> Result<Mesh, MeshLintError> {
@@ -376,6 +468,92 @@ fn check_degenerate_faces(mesh: &Mesh) -> Vec<Finding> {
                 face_ids: vec![face_id as u32],
                 metrics,
                 recommendation: Some("Run with --fix to remove degenerate faces.".into()),
+            })
+        })
+        .collect()
+}
+
+fn check_tiny_edges(mesh: &Mesh, threshold: f32) -> Vec<Finding> {
+    if threshold <= 0.0 {
+        return Vec::new();
+    }
+
+    let mut edge_faces: HashMap<Edge, Vec<u32>> = HashMap::new();
+    for (face_id, face) in mesh.faces.iter().enumerate() {
+        for edge in face_edges(*face) {
+            edge_faces
+                .entry(canonical_edge(edge))
+                .or_default()
+                .push(face_id as u32);
+        }
+    }
+
+    let mut edges = edge_faces.into_iter().collect::<Vec<_>>();
+    edges.sort_by_key(|(edge, _)| *edge);
+    edges
+        .into_iter()
+        .filter_map(|((a, b), face_ids)| {
+            let length = distance(mesh.vertices[a as usize], mesh.vertices[b as usize]);
+            if length >= threshold {
+                return None;
+            }
+            let mut metrics = HashMap::new();
+            metrics.insert("vertex_a".to_string(), a as f64);
+            metrics.insert("vertex_b".to_string(), b as f64);
+            metrics.insert("length_mm".to_string(), length as f64);
+            metrics.insert("threshold_mm".to_string(), threshold as f64);
+            Some(Finding {
+                rule_id: "mesh/tiny-edge".to_string(),
+                severity: Severity::Warn,
+                message: format!("edge {a}-{b} is {length:.5} mm; below {threshold:.5} mm"),
+                face_ids,
+                metrics,
+                recommendation: Some(
+                    "Simplify, weld, or remesh tiny edges before precision-sensitive operations."
+                        .into(),
+                ),
+            })
+        })
+        .collect()
+}
+
+fn check_bad_aspect_triangles(mesh: &Mesh, threshold: f32) -> Vec<Finding> {
+    if threshold <= 0.0 {
+        return Vec::new();
+    }
+
+    mesh.faces
+        .iter()
+        .enumerate()
+        .filter_map(|(face_id, face)| {
+            let lengths = edge_lengths(mesh, *face);
+            let shortest = lengths.iter().copied().fold(f32::INFINITY, |a, b| a.min(b));
+            let longest = lengths.iter().copied().fold(0.0_f32, |a, b| a.max(b));
+            if shortest <= f32::EPSILON {
+                return None;
+            }
+            let aspect_ratio = longest / shortest;
+            if aspect_ratio < threshold {
+                return None;
+            }
+
+            let mut metrics = HashMap::new();
+            metrics.insert("aspect_ratio".to_string(), aspect_ratio as f64);
+            metrics.insert("threshold".to_string(), threshold as f64);
+            metrics.insert("shortest_edge_mm".to_string(), shortest as f64);
+            metrics.insert("longest_edge_mm".to_string(), longest as f64);
+            Some(Finding {
+                rule_id: "mesh/bad-aspect-triangle".to_string(),
+                severity: Severity::Warn,
+                message: format!(
+                    "face {face_id} has aspect ratio {aspect_ratio:.2}; threshold is {threshold:.2}"
+                ),
+                face_ids: vec![face_id as u32],
+                metrics,
+                recommendation: Some(
+                    "Remesh skinny triangles if downstream geometry operations become unstable."
+                        .into(),
+                ),
             })
         })
         .collect()
@@ -671,7 +849,97 @@ fn check_inverted_normals(mesh: &Mesh) -> Vec<Finding> {
     }]
 }
 
-fn check_self_intersections(mesh: &Mesh) -> Vec<Finding> {
+fn check_zero_volume_shells(mesh: &Mesh) -> Vec<Finding> {
+    connected_shells(mesh)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(shell_id, shell)| {
+            let volume = shell_signed_volume(mesh, &shell).abs();
+            let surface_area = shell_surface_area(mesh, &shell);
+            if volume > f32::EPSILON || surface_area <= f32::EPSILON {
+                return None;
+            }
+
+            let mut metrics = HashMap::new();
+            metrics.insert("shell".to_string(), shell_id as f64);
+            metrics.insert("faces".to_string(), shell.len() as f64);
+            metrics.insert("volume_mm3".to_string(), volume as f64);
+            metrics.insert("surface_area_mm2".to_string(), surface_area as f64);
+            Some(Finding {
+                rule_id: "mesh/zero-volume-shell".to_string(),
+                severity: Severity::Warn,
+                message: format!("shell {shell_id} has surface area but near-zero enclosed volume"),
+                face_ids: shell.iter().map(|face_id| *face_id as u32).collect(),
+                metrics,
+                recommendation: Some(
+                    "Check for open sheets, duplicated opposite faces, or collapsed geometry."
+                        .into(),
+                ),
+            })
+        })
+        .collect()
+}
+
+fn check_suspicious_units(mesh: &Mesh, thresholds: &Thresholds) -> Vec<Finding> {
+    if mesh.vertices.is_empty() {
+        return Vec::new();
+    }
+
+    let (min, max) = mesh_bounds(mesh);
+    let dimensions = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let max_dimension = dimensions.iter().copied().fold(0.0_f32, |a, b| a.max(b));
+
+    let too_small = thresholds.suspicious_min_dimension_mm > 0.0
+        && max_dimension < thresholds.suspicious_min_dimension_mm;
+    let too_large = thresholds.suspicious_max_dimension_mm > 0.0
+        && max_dimension > thresholds.suspicious_max_dimension_mm;
+
+    if !too_small && !too_large {
+        return Vec::new();
+    }
+
+    let mut metrics = HashMap::new();
+    metrics.insert("x_mm".to_string(), dimensions[0] as f64);
+    metrics.insert("y_mm".to_string(), dimensions[1] as f64);
+    metrics.insert("z_mm".to_string(), dimensions[2] as f64);
+    metrics.insert("max_dimension_mm".to_string(), max_dimension as f64);
+    metrics.insert(
+        "min_threshold_mm".to_string(),
+        thresholds.suspicious_min_dimension_mm as f64,
+    );
+    metrics.insert(
+        "max_threshold_mm".to_string(),
+        thresholds.suspicious_max_dimension_mm as f64,
+    );
+
+    let message = if too_small {
+        format!("model maximum dimension is {max_dimension:.3} mm; units may be too small")
+    } else {
+        format!("model maximum dimension is {max_dimension:.3} mm; units may be too large")
+    };
+
+    vec![Finding {
+        rule_id: "mesh/unit-suspicious".to_string(),
+        severity: Severity::Warn,
+        message,
+        face_ids: Vec::new(),
+        metrics,
+        recommendation: Some(
+            "Confirm whether the model was exported in millimeters, inches, meters, or scaled units."
+                .into(),
+        ),
+    }]
+}
+
+fn check_self_intersections(mesh: &Mesh, max_tests: usize) -> Vec<Finding> {
+    if max_tests == 0 {
+        return vec![self_intersection_skipped_finding(
+            mesh.faces.len(),
+            0,
+            max_tests,
+        )];
+    }
+
     let face_boxes = mesh
         .faces
         .iter()
@@ -684,6 +952,7 @@ fn check_self_intersections(mesh: &Mesh) -> Vec<Finding> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut findings = Vec::new();
+    let mut tests = 0usize;
 
     for (order_index, &a_id) in face_order.iter().enumerate() {
         let a_max_x = face_boxes[a_id].1[0];
@@ -697,6 +966,16 @@ fn check_self_intersections(mesh: &Mesh) -> Vec<Finding> {
                 || !bounds_overlap(face_boxes[a_id], face_boxes[b_id])
             {
                 continue;
+            }
+
+            tests += 1;
+            if tests > max_tests {
+                findings.push(self_intersection_skipped_finding(
+                    mesh.faces.len(),
+                    tests,
+                    max_tests,
+                ));
+                break;
             }
 
             if triangles_intersect(mesh, face_a, face_b) {
@@ -716,9 +995,36 @@ fn check_self_intersections(mesh: &Mesh) -> Vec<Finding> {
                 });
             }
         }
+        if tests > max_tests {
+            break;
+        }
     }
 
     findings
+}
+
+fn self_intersection_skipped_finding(
+    face_count: usize,
+    attempted_tests: usize,
+    max_tests: usize,
+) -> Finding {
+    let mut metrics = HashMap::new();
+    metrics.insert("faces".to_string(), face_count as f64);
+    metrics.insert("attempted_tests".to_string(), attempted_tests as f64);
+    metrics.insert("max_tests".to_string(), max_tests as f64);
+    Finding {
+        rule_id: "mesh/self-intersection-skipped".to_string(),
+        severity: Severity::Warn,
+        message: format!(
+            "self-intersection check skipped after {attempted_tests} candidate tests; limit is {max_tests}"
+        ),
+        face_ids: Vec::new(),
+        metrics,
+        recommendation: Some(
+            "Increase --max-self-intersection-tests for a deeper check, or run on a simplified mesh."
+                .into(),
+        ),
+    }
 }
 
 fn check_large_cross_sections(mesh: &Mesh, thresholds: &Thresholds) -> Vec<Finding> {
@@ -1117,8 +1423,32 @@ fn shell_signed_volume(mesh: &Mesh, shell: &[usize]) -> f32 {
         .sum()
 }
 
+fn shell_surface_area(mesh: &Mesh, shell: &[usize]) -> f32 {
+    shell
+        .iter()
+        .map(|&face_id| triangle_area_from_vertices(&mesh.vertices, mesh.faces[face_id]))
+        .sum()
+}
+
 fn face_edges(face: [u32; 3]) -> [(u32, u32); 3] {
     [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])]
+}
+
+fn edge_lengths(mesh: &Mesh, face: [u32; 3]) -> [f32; 3] {
+    [
+        distance(
+            mesh.vertices[face[0] as usize],
+            mesh.vertices[face[1] as usize],
+        ),
+        distance(
+            mesh.vertices[face[1] as usize],
+            mesh.vertices[face[2] as usize],
+        ),
+        distance(
+            mesh.vertices[face[2] as usize],
+            mesh.vertices[face[0] as usize],
+        ),
+    ]
 }
 
 fn canonical_edge(edge: (u32, u32)) -> (u32, u32) {
@@ -1161,6 +1491,18 @@ fn face_bounds(mesh: &Mesh, face: [u32; 3]) -> ([f32; 3], [f32; 3]) {
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
     for vertex in vertices {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(vertex[axis]);
+            max[axis] = max[axis].max(vertex[axis]);
+        }
+    }
+    (min, max)
+}
+
+fn mesh_bounds(mesh: &Mesh) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for vertex in &mesh.vertices {
         for axis in 0..3 {
             min[axis] = min[axis].min(vertex[axis]);
             max[axis] = max[axis].max(vertex[axis]);
@@ -1269,6 +1611,10 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 fn distance_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
     let delta = sub(a, b);
     dot(delta, delta)
+}
+
+fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    distance_sq(a, b).sqrt()
 }
 
 #[cfg(test)]
